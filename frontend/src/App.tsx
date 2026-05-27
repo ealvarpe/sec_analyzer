@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { createChart, CandlestickSeries, HistogramSeries } from 'lightweight-charts';
+import type { ISeriesPrimitive, SeriesAttachedParameter, Time } from 'lightweight-charts';
 import { 
   Play, 
   Download, 
@@ -202,6 +203,141 @@ function parseMarkdown(md: string, stripJsonLevels: boolean = false): string {
   return resultHtml.join('\n');
 }
 
+const sessionHighlighter = (time: Time) => {
+  let timestamp: number;
+  if (typeof time === 'number') {
+    timestamp = time;
+  } else if (time && typeof time === 'object' && 'year' in time) {
+    const date = new Date((time as any).year, (time as any).month - 1, (time as any).day);
+    timestamp = Math.floor(date.getTime() / 1000);
+  } else {
+    return 'rgba(0, 0, 0, 0)';
+  }
+
+  const date = new Date(timestamp * 1000);
+  
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/New_York",
+    hour12: false,
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  
+  const timeStr = formatter.format(date);
+  const [hStr, mStr] = timeStr.split(':');
+  const hour = parseInt(hStr, 10);
+  const minute = parseInt(mStr, 10);
+  
+  // Pre-market: 04:00 to 09:30 EST
+  if (hour >= 4 && (hour < 9 || (hour === 9 && minute < 30))) {
+    return 'rgba(56, 189, 248, 0.08)'; // Shaded light blue/indigo
+  }
+  // Regular session: 09:30 to 16:00 EST
+  if ((hour > 9 || (hour === 9 && minute >= 30)) && hour < 16) {
+    return 'rgba(0, 0, 0, 0)'; // Transparent (regular session)
+  }
+  // Post-market: 16:00 to 20:00 EST
+  if (hour >= 16 && hour < 20) {
+    return 'rgba(251, 146, 60, 0.08)'; // Shaded warm amber/orange
+  }
+  // Closed/Night: 20:00 to 04:00 EST
+  return 'rgba(168, 85, 247, 0.03)'; // Dark purple/neutral shading
+};
+
+class SessionShadingPrimitive implements ISeriesPrimitive<Time> {
+  private _chart: any = undefined;
+  private _series: any = undefined;
+  private _requestUpdate: (() => void) | undefined = undefined;
+  private _backgroundColors: { time: Time; color: string }[] = [];
+  private _paneViews: any[];
+  private _highlighter: (time: Time) => string;
+  private _paneViewData: { data: { x: number; color: string }[]; barWidth: number } = { data: [], barWidth: 6 };
+
+  constructor(highlighter: (time: Time) => string) {
+    this._highlighter = highlighter;
+    this._paneViews = [{
+      update: () => {
+        if (!this._chart) return;
+        const timeScale = this._chart.timeScale();
+        const data = this._backgroundColors.map(d => ({
+          x: timeScale.timeToCoordinate(d.time) ?? -100,
+          color: d.color,
+        }));
+        
+        let barWidth = 6;
+        if (data.length > 1) {
+          barWidth = data[1].x - data[0].x;
+        }
+        this._paneViewData = { data, barWidth };
+      },
+      renderer: () => {
+        return {
+          draw: (target: any) => {
+            const viewData = this._paneViewData;
+            if (!viewData || !viewData.data.length) return;
+            
+            target.useBitmapCoordinateSpace((scope: any) => {
+              const ctx = scope.context;
+              const yTop = 0;
+              const height = scope.bitmapSize.height;
+              const halfWidth = (scope.horizontalPixelRatio * viewData.barWidth) / 2;
+              const cutOff = -1 * (halfWidth + 1);
+              const maxX = scope.bitmapSize.width;
+              
+              viewData.data.forEach((point: any) => {
+                if (point.color === 'rgba(0, 0, 0, 0)' || !point.color) return;
+                const xScaled = point.x * scope.horizontalPixelRatio;
+                if (xScaled < cutOff) return;
+                ctx.fillStyle = point.color;
+                const x1 = Math.max(0, Math.round(xScaled - halfWidth));
+                const x2 = Math.min(maxX, Math.round(xScaled + halfWidth));
+                ctx.fillRect(x1, yTop, x2 - x1, height);
+              });
+            });
+          }
+        };
+      },
+      zOrder: () => 'bottom'
+    }];
+  }
+
+  attached({ chart, series, requestUpdate }: SeriesAttachedParameter<Time>): void {
+    this._chart = chart;
+    this._series = series;
+    this._requestUpdate = requestUpdate;
+    this._series.subscribeDataChanged(this._fireDataUpdated);
+    this._fireDataUpdated('full');
+  }
+
+  detached(): void {
+    if (this._series) {
+      this._series.unsubscribeDataChanged(this._fireDataUpdated);
+    }
+    this._chart = undefined;
+    this._series = undefined;
+    this._requestUpdate = undefined;
+  }
+
+  paneViews(): any[] {
+    return this._paneViews;
+  }
+
+  updateAllViews(): void {
+    this._paneViews.forEach(v => v.update());
+  }
+
+  private _fireDataUpdated = (_scope: any) => {
+    if (!this._series) return;
+    this._backgroundColors = this._series.data().map((dataPoint: any) => ({
+      time: dataPoint.time,
+      color: this._highlighter(dataPoint.time),
+    }));
+    if (this._requestUpdate) {
+      this._requestUpdate();
+    }
+  };
+}
+
 function TradingViewChart({ 
   ticker, 
   dataRoot, 
@@ -298,6 +434,11 @@ function TradingViewChart({
         wickUpColor: '#10b981',
         wickDownColor: '#ef4444',
       });
+
+      // Attach session shading primitive
+      const shadingPrimitive = new SessionShadingPrimitive(sessionHighlighter);
+      candleSeries.attachPrimitive(shadingPrimitive);
+
 
       const volumeSeries = chart.addSeries(HistogramSeries, {
         color: '#26a69a',
@@ -626,7 +767,7 @@ function TradingViewChart({
             <span style={{ marginLeft: '0.5rem', fontSize: '0.9rem', color: 'var(--text-secondary)' }}>Loading prices...</span>
           </div>
         )}
-        <div ref={containerRef} className="chart-container" />
+        <div ref={containerRef} className="chart-container" style={{ height: chartHeight }} />
         
         {/* Resize handle bar */}
         <div 
@@ -703,6 +844,24 @@ export default function App() {
   // App state
   const [allTickersList, setAllTickersList] = useState<string[]>([]);
   const [selectedTicker, setSelectedTicker] = useState("");
+  const [tickerSearchQuery, setTickerSearchQuery] = useState("");
+  const [showSuggestions, setShowSuggestions] = useState(false);
+  const [showAllTickersModal, setShowAllTickersModal] = useState(false);
+  const suggestionsRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    setTickerSearchQuery(selectedTicker);
+  }, [selectedTicker]);
+
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (suggestionsRef.current && !suggestionsRef.current.contains(event.target as Node)) {
+        setShowSuggestions(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
   const [selectedCategory, setSelectedCategory] = useState("filings");
   const [categoryData, setCategoryData] = useState<any[]>([]);
   const [progressStatuses, setProgressStatuses] = useState<Record<string, any>>({});
@@ -1419,22 +1578,97 @@ export default function App() {
         <div style={{ display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
           <div className="card" style={{ padding: '1.25rem' }}>
             <div className="flex-row" style={{ flexWrap: 'wrap', gap: '1rem' }}>
-              <div className="ticker-selector">
+              <div className="ticker-selector" style={{ display: 'flex', gap: '0.5rem', alignItems: 'center' }}>
                 <label>Select Ticker:</label>
-                <select 
-                  className="ticker-select" 
-                  value={selectedTicker} 
-                  onChange={e => setSelectedTicker(e.target.value)}
-                  disabled={allTickersList.length === 0}
-                >
-                  {allTickersList.length === 0 ? (
-                    <option>No analyzed tickers yet</option>
-                  ) : (
-                    allTickersList.map(t => (
-                      <option key={t} value={t}>{t}</option>
-                    ))
+                
+                {/* Autocomplete Input */}
+                <div style={{ position: 'relative' }} ref={suggestionsRef}>
+                  <input
+                    type="text"
+                    className="form-control"
+                    style={{ width: '160px', background: 'rgba(17, 24, 39, 0.8)', border: '1px solid var(--border-color)', borderRadius: '8px' }}
+                    placeholder={allTickersList.length === 0 ? "No analyzed tickers" : "Search ticker..."}
+                    value={tickerSearchQuery}
+                    onChange={e => {
+                      const query = e.target.value.toUpperCase().trim();
+                      setTickerSearchQuery(e.target.value);
+                      setShowSuggestions(true);
+                      if (allTickersList.includes(query)) {
+                        setSelectedTicker(query);
+                      }
+                    }}
+                    onFocus={() => setShowSuggestions(true)}
+                    disabled={allTickersList.length === 0}
+                  />
+                  
+                  {/* Autocomplete suggestions dropdown */}
+                  {showSuggestions && tickerSearchQuery && (
+                    <div 
+                      style={{
+                        position: 'absolute',
+                        top: '100%',
+                        left: 0,
+                        right: 0,
+                        background: 'rgba(18, 25, 41, 0.95)',
+                        backdropFilter: 'blur(16px)',
+                        border: '1px solid var(--border-color)',
+                        borderRadius: '8px',
+                        boxShadow: 'var(--shadow-lg)',
+                        zIndex: 100,
+                        maxHeight: '200px',
+                        overflowY: 'auto',
+                        marginTop: '4px'
+                      }}
+                    >
+                      {allTickersList
+                        .filter(t => t.includes(tickerSearchQuery.toUpperCase().trim()))
+                        .map(t => (
+                          <div
+                            key={t}
+                            style={{
+                              padding: '0.6rem 1rem',
+                              cursor: 'pointer',
+                              transition: 'background 0.2s',
+                              color: 'var(--text-primary)',
+                              fontSize: '0.9rem'
+                            }}
+                            onMouseEnter={e => { e.currentTarget.style.background = 'rgba(99, 102, 241, 0.15)'; }}
+                            onMouseLeave={e => { e.currentTarget.style.background = 'none'; }}
+                            onClick={() => {
+                              setSelectedTicker(t);
+                              setTickerSearchQuery(t);
+                              setShowSuggestions(false);
+                            }}
+                          >
+                            {t}
+                          </div>
+                        ))}
+                    </div>
                   )}
-                </select>
+                </div>
+
+                {/* List All Button */}
+                <button
+                  className="btn"
+                  type="button"
+                  style={{ 
+                    width: 'auto', 
+                    padding: '0.5rem 0.8rem', 
+                    background: 'rgba(30, 41, 59, 0.4)', 
+                    border: '1px solid var(--border-color)', 
+                    borderRadius: '6px',
+                    color: 'var(--text-secondary)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '0.3rem'
+                  }}
+                  onClick={() => setShowAllTickersModal(true)}
+                  disabled={allTickersList.length === 0}
+                  title="Show all available tickers"
+                >
+                  <Layers size={14} />
+                  <span style={{ fontSize: '0.85rem' }}>List All</span>
+                </button>
                 <button 
                   className="btn" 
                   style={{ width: 'auto', background: 'rgba(30, 41, 59, 0.4)', padding: '0.5rem', border: '1px solid var(--border-color)', borderRadius: '6px' }}
@@ -1843,6 +2077,96 @@ export default function App() {
           </div>
         </div>
       </div>
+      {showAllTickersModal && (
+        <div style={{
+          position: 'fixed',
+          top: 0, left: 0, right: 0, bottom: 0,
+          background: 'rgba(9, 13, 22, 0.85)',
+          backdropFilter: 'blur(8px)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          zIndex: 1000,
+          padding: '2rem'
+        }}>
+          <div className="card" style={{
+            width: '100%',
+            maxWidth: '500px',
+            background: 'var(--bg-main)',
+            border: '1px solid var(--border-color)',
+            boxShadow: 'var(--shadow-lg)',
+            borderRadius: '12px',
+            padding: '2rem',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: '1.5rem',
+            position: 'relative'
+          }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <h3 style={{ fontWeight: 600, color: 'var(--text-primary)', display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
+                <Layers size={18} style={{ color: 'var(--primary)' }} />
+                Available Tickers
+              </h3>
+              <button 
+                onClick={() => setShowAllTickersModal(false)}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  color: 'var(--text-secondary)',
+                  fontSize: '1.5rem',
+                  cursor: 'pointer',
+                  lineHeight: 1
+                }}
+              >
+                &times;
+              </button>
+            </div>
+            
+            <p style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>
+              The following tickers have been processed and are ready for analysis:
+            </p>
+
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fill, minmax(90px, 1fr))',
+              gap: '0.75rem',
+              maxHeight: '300px',
+              overflowY: 'auto',
+              padding: '0.25rem'
+            }}>
+              {allTickersList.length === 0 ? (
+                <p style={{ gridColumn: '1/-1', textAlign: 'center', color: 'var(--text-muted)', padding: '1rem' }}>
+                  No tickers analyzed yet.
+                </p>
+              ) : (
+                allTickersList.map(t => (
+                  <button
+                    key={t}
+                    type="button"
+                    onClick={() => {
+                      setSelectedTicker(t);
+                      setShowAllTickersModal(false);
+                    }}
+                    style={{
+                      background: selectedTicker === t ? 'var(--primary-gradient)' : 'rgba(30, 41, 59, 0.4)',
+                      border: selectedTicker === t ? 'none' : '1px solid var(--border-color)',
+                      color: selectedTicker === t ? 'white' : 'var(--text-primary)',
+                      padding: '0.6rem 0.8rem',
+                      borderRadius: '6px',
+                      fontWeight: 600,
+                      cursor: 'pointer',
+                      transition: 'all 0.2s',
+                      textAlign: 'center'
+                    }}
+                  >
+                    {t}
+                  </button>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

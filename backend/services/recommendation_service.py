@@ -14,6 +14,36 @@ class CustomStreamer(Streamer):
     def _export(self, json_data, symbol, data_category):
         pass  # Do not write files
 
+    def _add_symbol_to_sessions(
+        self,
+        quote_session: str,
+        chart_session: str,
+        exchange_symbol: str,
+        timeframe: str = "1m",
+        numb_candles: int = 10
+        ):
+        timeframe_map = {
+            '1m': '1',
+            '5m': '5', 
+            '15m': '15',
+            '30m': '30',
+            '1h': '60',
+            '2h': '120',
+            '4h': '240',
+            '1d': '1D',
+            '1w': '1W',
+            '1M': '1M'
+        }
+        import json
+        resolve_symbol = json.dumps({"adjustment": "splits", "symbol": exchange_symbol, "session": "extended"})
+        self.stream_obj.send_message("quote_add_symbols", [quote_session, f"={resolve_symbol}"])
+        self.stream_obj.send_message("resolve_symbol", [chart_session, "sds_sym_1", f"={resolve_symbol}"])
+        self.stream_obj.send_message("create_series", [chart_session,
+                                                       "sds_1", "s1", "sds_sym_1", timeframe_map.get(timeframe, "1"),
+                                                       numb_candles, ""])
+        self.stream_obj.send_message("quote_fast_symbols", [quote_session, exchange_symbol])
+
+
 def get_pricing_levels(ticker: str, current_price: float | None, data_root: str) -> list[dict]:
     """
     Extract key offering prices and exercise prices from database/parquet records
